@@ -15,6 +15,10 @@
   #define ALC_API __declspec(dllexport)
 #endif
 
+#ifndef M_PI
+  #define M_PI (3.14159265358979323846264338327950288)
+#endif
+
 #include "AL/al.h"
 #include "AL/alc.h"
 #include "SDL.h"
@@ -521,6 +525,9 @@ struct ALCcontext_struct
     ALCcontext *next;
 };
 
+/* forward declarations */
+static int source_get_offset(ALsource *src, ALenum param);
+static void source_set_offset(ALsource *src, ALenum param, ALfloat value);
 
 /* the just_queued list is backwards. Add it to the queue in the correct order. */
 static void queue_new_buffer_items_recursive(BufferQueue *queue, BufferQueueItem *items)
@@ -1758,9 +1765,10 @@ static void mix_context(ALCcontext *ctx, float *stream, int len)
                 SDL_assert(prev != NULL);
                 prev->playlist_next = next;
             }
+        } else {
+            prev = i;
         }
         SDL_AtomicSet(&i->mixer_accessible, 0);
-        prev = i;
     }
 }
 
@@ -2346,7 +2354,6 @@ ALCdevice *alcCaptureOpenDevice(const ALCchar *devicename, ALCuint frequency, AL
     desired.freq = frequency;
     desired.samples = 1024;  FIXME("is this a reasonable value?");
     desired.callback = capture_device_callback;
-    desired.userdata = device;
 
     if (SDL_strcmp(devicename, DEFAULT_CAPTURE_DEVICE) != 0) {
         sdldevname = devicename;  /* we want NULL for the best SDL default unless app is explicit. */
@@ -2373,6 +2380,8 @@ ALCdevice *alcCaptureOpenDevice(const ALCchar *devicename, ALCuint frequency, AL
     }
 
     device->capture.ring.buffer = ringbuf;
+
+    desired.userdata = device;
 
     device->sdldevice = SDL_OpenAudioDevice(sdldevname, 1, &desired, NULL, 0);
     if (!device->sdldevice) {
@@ -3425,7 +3434,7 @@ static void _alSourcefv(const ALuint name, const ALenum param, const ALfloat *va
         case AL_SEC_OFFSET:
         case AL_SAMPLE_OFFSET:
         case AL_BYTE_OFFSET:
-            FIXME("offsets");
+            source_set_offset(src, param, *values);
             break;
 
         default: set_al_error(ctx, AL_INVALID_ENUM); return;
@@ -3498,9 +3507,8 @@ static void set_source_static_buffer(ALCcontext *ctx, ALsource *src, const ALuin
                 FIXME("need a way to prealloc space in the stream, so the mixer doesn't have to malloc");
             }
 
-            /* this can happen if you alSourceStop() and change the buffer while the exact source is in the middle of mixing */
-            /*wait_if_source_is_mixing(ctx, src);*/
-            /* NOTE: the above wait is commented out because alSourceStop() currently waits too, so you can't end up in a race condition here. The assert is here to verify that. */
+            /* this can happen if you alSource(AL_BUFFER) while the exact source is in the middle of mixing */
+            wait_if_source_is_mixing(ctx, src);
             SDL_assert(SDL_AtomicGet(&src->mixer_accessible) == 0);
 
             if (src->buffer != buffer) {
@@ -3556,7 +3564,7 @@ static void _alSourceiv(const ALuint name, const ALenum param, const ALint *valu
         case AL_SEC_OFFSET:
         case AL_SAMPLE_OFFSET:
         case AL_BYTE_OFFSET:
-            FIXME("offsets");
+            source_set_offset(src, param, (ALfloat)*values);
             break;
 
         default: set_al_error(ctx, AL_INVALID_ENUM); return;
@@ -3624,7 +3632,7 @@ static void _alGetSourcefv(const ALuint name, const ALenum param, ALfloat *value
         case AL_SEC_OFFSET:
         case AL_SAMPLE_OFFSET:
         case AL_BYTE_OFFSET:
-            FIXME("offsets");
+            *values = source_get_offset(src, param);
             break;
 
         default: set_al_error(ctx, AL_INVALID_ENUM); break;
@@ -3683,6 +3691,7 @@ static void _alGetSourceiv(const ALuint name, const ALenum param, ALint *values)
         case AL_SOURCE_STATE: *values = (ALint) SDL_AtomicGet(&src->state); break;
         case AL_SOURCE_TYPE: *values = (ALint) src->type; break;
         case AL_BUFFER: *values = (ALint) (src->buffer ? src->buffer->name : 0); break;
+        // !!! FIXME: AL_BUFFERS_QUEUED is the total number of buffers pending, playing, and processed, so this is wrong. It might also have to be 1 if there's a static buffer, but I'm not sure.
         case AL_BUFFERS_QUEUED: *values = (ALint) SDL_AtomicGet(&src->buffer_queue.num_items); break;
         case AL_BUFFERS_PROCESSED: *values = (ALint) SDL_AtomicGet(&src->buffer_queue_processed.num_items); break;
         case AL_SOURCE_RELATIVE: *values = (ALint) src->source_relative; break;
@@ -3701,7 +3710,7 @@ static void _alGetSourceiv(const ALuint name, const ALenum param, ALint *values)
         case AL_SEC_OFFSET:
         case AL_SAMPLE_OFFSET:
         case AL_BYTE_OFFSET:
-            FIXME("offsets");
+            *values = (ALint) source_get_offset(src, param);
             break;
 
         default: set_al_error(ctx, AL_INVALID_ENUM); break;
@@ -3884,6 +3893,79 @@ static void source_pause(ALCcontext *ctx, const ALuint name)
     ALsource *src = get_source(ctx, name, NULL);
     if (src) {
         SDL_AtomicCAS(&src->state, AL_PLAYING, AL_PAUSED);
+    }
+}
+
+static int source_get_offset(ALsource *src, ALenum param)
+{
+    int offset = 0;
+    int framesize = sizeof(float);
+    int freq = 1;
+    if (src->type == AL_STREAMING) {
+        /* streaming: the offset counts from the first processed buffer in the queue. */
+        BufferQueueItem *item = src->buffer_queue.head;
+        if (item) {
+            framesize = (int)(item->buffer->channels * sizeof(float));
+            freq = (int)(item->buffer->frequency);
+            int proc_buf = SDL_AtomicGet(&src->buffer_queue_processed.num_items);
+            offset = (proc_buf * item->buffer->len + src->offset);
+        }
+    } else {
+        framesize = (int)(src->buffer->channels * sizeof(float));
+        freq = (int)src->buffer->frequency;
+        offset = src->offset;
+    }
+    switch(param) {
+        case AL_SAMPLE_OFFSET: return offset / framesize; break;
+        case AL_SEC_OFFSET: return (offset / framesize) / freq; break;
+        case AL_BYTE_OFFSET: return offset; break;
+        default: return 0; break;
+    }
+}
+
+static void source_set_offset(ALsource *src, ALenum param, ALfloat value)
+{
+    ALCcontext *ctx = get_current_context();
+    if (!ctx) {
+        set_al_error(ctx, AL_INVALID_OPERATION);
+        return;
+    }
+
+    int bufflen = 0;
+    int framesize = sizeof(float);
+    int freq = 1;
+
+    if (src->type == AL_STREAMING) {
+        FIXME("set_offset for streaming sources not implemented");
+        return;
+    } else {
+        bufflen = (int)src->buffer->len;
+        framesize = (int)(src->buffer->channels * sizeof(float));
+        freq = (int)src->buffer->frequency;
+    }
+
+    int offset = -1;
+    switch(param) {
+        case AL_SAMPLE_OFFSET:
+            offset = value * framesize;
+            break;
+        case AL_SEC_OFFSET:
+            offset = value * freq * framesize;
+            break;
+        case AL_BYTE_OFFSET:
+            offset = ((int)value / framesize) * framesize;
+            break;
+    }
+    if (offset < 0 || offset > bufflen) {
+        set_al_error(ctx, AL_INVALID_VALUE);
+        return;
+    }
+
+    ALboolean was_playing = SDL_AtomicCAS(&src->state, AL_PLAYING, AL_PAUSED);
+    wait_if_source_is_mixing(ctx, src);
+    src->offset = offset;
+    if (was_playing) {
+        SDL_AtomicSet(&src->state, AL_PLAYING);
     }
 }
 
